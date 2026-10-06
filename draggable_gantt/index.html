@@ -3,28 +3,30 @@
 <head>
 <meta charset="utf-8" />
 <style>
-  html, body { margin:0; padding:0; background:transparent;
+  html, body { margin:0; padding:0; height:100%; background:transparent;
     font-family:"Source Sans Pro","Segoe UI",-apple-system,sans-serif; color:#fafafa; }
-  .wrap { width:100%; }
+  .wrap { width:100%; box-sizing:border-box; }
+  .wrap.fs { position:fixed; inset:0; z-index:2147483000; background:#0e1117;
+    padding:8px 12px 10px 12px; overflow:hidden; }
   .hdr { display:flex; align-items:center; justify-content:space-between; margin:0 2px 6px 2px; }
   .title { font-size:17px; font-weight:600; }
   .expbtn { background:rgba(128,128,128,.18); color:#fafafa; border:1px solid rgba(128,128,128,.4);
-    border-radius:5px; padding:4px 10px; font-size:12px; cursor:pointer; }
+    border-radius:5px; padding:4px 10px; font-size:12px; cursor:pointer; white-space:nowrap; }
   .expbtn:hover { background:rgba(128,128,128,.3); }
   .legend { display:flex; flex-wrap:wrap; gap:6px 16px; justify-content:center;
-    margin:2px 0 12px 0; font-size:11px; }
+    margin:2px 0 10px 0; font-size:11px; }
   .li { display:flex; align-items:center; gap:6px; white-space:nowrap; }
-  .sw { width:14px; height:12px; border-radius:2px; display:inline-block; }
+  .sw { width:14px; height:12px; border-radius:2px; display:inline-block; flex:none; }
   .chart { display:flex; }
   .ylabel { width:22px; display:flex; align-items:center; justify-content:center;
-    font-size:12px; opacity:.85; }
+    font-size:12px; opacity:.85; flex:none; }
   .ylabel span { transform:rotate(-90deg); white-space:nowrap; }
-  .grid { flex:1; display:flex; }
+  .grid { flex:1; display:flex; min-width:0; }
   .gutter { width:150px; flex:none; }
   .gname { padding-left:8px; font-size:11.5px;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:.95; }
   .plot { position:relative; flex:1; border-left:1px solid rgba(128,128,128,.35);
-    border-bottom:1px solid rgba(128,128,128,.35); }
+    border-bottom:1px solid rgba(128,128,128,.35); min-width:0; }
   .lane { position:absolute; left:0; right:0;
     border-bottom:1px solid rgba(128,128,128,.14); }
   .lane.target { background:rgba(46,204,113,.18); }
@@ -38,13 +40,12 @@
   .bar span { pointer-events:none; }
   .xaxis { display:flex; }
   .xspacer { width:172px; flex:none; }
-  .xticks { position:relative; flex:1; height:20px; }
+  .xticks { position:relative; flex:1; height:20px; min-width:0; }
   .xt { position:absolute; top:3px; font-size:10px; opacity:.7; white-space:nowrap;
     transform:translateX(-50%); }
   .xtitle { text-align:center; font-size:12px; opacity:.85; margin-top:6px; }
-  .hint { font-size:11px; opacity:.6; margin:10px 2px 2px 2px; }
+  .hint { font-size:11px; opacity:.6; margin:8px 2px 0 2px; }
   .empty { padding:14px; opacity:.6; font-size:12px; }
-  .wrap.fs { background:#0e1117; padding:10px; }
 </style>
 </head>
 <body>
@@ -61,21 +62,25 @@
   function setValue(v){ post(VALUE,{value:v,dataType:"json"}); }
   post(READY,{apiVersion:1});
 
-  var ARGS={}, EXPERTS=[], drag=null, nonce=0;
-  var ROWH_BASE=45, ROWH_EXP=70, BARH_BASE=27, BARH_EXP=44;
-  var ROWH=ROWH_BASE, BARH=BARH_BASE, expanded=false;
+  var ARGS={}, EXPERTS=[], drag=null, nonce=0, expanded=false, adjusting=false;
+  var ROWH=45, BARH=27;
+  var ROW_MIN=24, ROW_MAX=140;
 
   window.addEventListener("message", function(e){
     if(!e.data || e.data.type!==RENDER){ return; }
     ARGS=e.data.args||{};
-    build();
+    render();
   });
 
   document.addEventListener("fullscreenchange", function(){
     expanded = !!document.fullscreenElement;
-    ROWH = expanded ? ROWH_EXP : ROWH_BASE;
-    BARH = expanded ? BARH_EXP : BARH_BASE;
-    build();
+    render();
+  });
+
+  var _rt=null;
+  window.addEventListener("resize", function(){
+    if(_rt){ clearTimeout(_rt); }
+    _rt=setTimeout(function(){ render(); }, 120);
   });
 
   function el(cls, txt){
@@ -87,20 +92,30 @@
 
   function toggleExpand(){
     expanded = !expanded;
-    ROWH = expanded ? ROWH_EXP : ROWH_BASE;
-    BARH = expanded ? BARH_EXP : BARH_BASE;
+    var w=document.getElementById("wrap");
     try {
       if(expanded){
-        var w=document.getElementById("wrap");
         if(w && w.requestFullscreen){ w.requestFullscreen(); }
       } else if(document.fullscreenElement && document.exitFullscreen){
         document.exitFullscreen();
       }
     } catch(err){}
-    build();
+    render();
+    if(expanded){
+      try { if(w && w.scrollIntoView){ w.scrollIntoView({block:"start"}); } } catch(e){}
+    }
   }
 
-  function build(){
+  /* height of everything that is NOT the lane area (header, legend, axis, hint) */
+  function chromeHeight(){
+    var W=document.querySelector(".wrap");
+    if(!W){ return 150; }
+    var plot=document.querySelector(".plot");
+    var ph = plot ? plot.offsetHeight : 0;
+    return Math.max(70, W.offsetHeight - ph);
+  }
+
+  function render(){
     var wrap=document.getElementById("wrap");
     var rows=ARGS.rows||[];
     wrap.innerHTML="";
@@ -109,6 +124,27 @@
       setHeight(50); return;
     }
     EXPERTS=ARGS.experts||[];
+    var n=Math.max(1, EXPERTS.length);
+
+    // ── in expanded mode, stretch the lanes to fill the screen ──
+    if(expanded && !adjusting){
+      var target=window.innerHeight || screen.height;
+      var chrome=chromeHeight();
+      var newRow=Math.floor((target-chrome)/n);
+      if(newRow<ROW_MIN){ newRow=ROW_MIN; }
+      if(newRow>ROW_MAX){ newRow=ROW_MAX; }
+      if(Math.abs(newRow-ROWH)>1){
+        ROWH=newRow;
+        adjusting=true;
+        render();
+        adjusting=false;
+        return;
+      }
+    } else if(!expanded && ROWH!==45){
+      ROWH=45;
+    }
+    BARH=Math.max(12, Math.min(ROWH-14, 46));
+
     var tmin=ARGS.tmin, tmax=ARGS.tmax;
     if(tmax<=tmin){ tmax=tmin+1; }
     var span=tmax-tmin;
@@ -119,7 +155,7 @@
     hdr.appendChild(el("title", ARGS.title||"Resolved Expert Schedule"));
     var btn=document.createElement("button");
     btn.className="expbtn";
-    btn.textContent = expanded ? "⛶ Restore" : "⛶ Expand";
+    btn.textContent = expanded ? "⛶ Restore" : "⛶ Expand to full screen";
     btn.addEventListener("click", toggleExpand);
     hdr.appendChild(btn);
     W.appendChild(hdr);
@@ -159,7 +195,7 @@
     grid.appendChild(gutter);
 
     var plot=el("plot");
-    plot.style.height=(EXPERTS.length*ROWH)+"px";
+    plot.style.height=(n*ROWH)+"px";
 
     var ticks=ARGS.ticks||[];
     for(var t=0;t<ticks.length;t++){
@@ -194,7 +230,7 @@
         plot.appendChild(nv);
       }
     }
-    for(var L=0; L<EXPERTS.length; L++){
+    for(var L=0; L<n; L++){
       var lane=el("lane");
       lane.style.top=(L*ROWH)+"px";
       lane.style.height=ROWH+"px";
@@ -207,7 +243,7 @@
       if(!byExpert[ex]){ byExpert[ex]=[]; }
       byExpert[ex].push(rows[r]);
     }
-    for(var x=0;x<EXPERTS.length;x++){
+    for(var x=0;x<n;x++){
       var items2=byExpert[EXPERTS[x]]||[];
       for(var b=0;b<items2.length;b++){
         plot.appendChild(makeBar(items2[b], EXPERTS[x], tmin, span, x));
@@ -230,10 +266,19 @@
     xa.appendChild(xt);
     W.appendChild(xa);
     W.appendChild(el("xtitle","Time (EDT)"));
-    W.appendChild(el("hint","Drag a bar up or down to another expert lane. Time is locked — only the lane changes. Use ⛶ Expand for a bigger view."));
+    if(!expanded){
+      W.appendChild(el("hint","Drag a bar up or down to another expert lane. Time is locked — only the lane changes."));
+    }
 
     wrap.appendChild(W);
-    setHeight(W.offsetHeight+30);
+
+    // ── frame height: fill the screen when expanded ──────────
+    if(expanded){
+      var targetH=window.innerHeight || screen.height;
+      setHeight(targetH);
+    } else {
+      setHeight(W.offsetHeight+30);
+    }
   }
 
   function makeBar(item, expert, tmin, span, laneIdx){
@@ -313,6 +358,5 @@
     for(var i=0;i<t.length;i++){ t[i].classList.remove("target"); }
   }
 </script>
-<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","spa":2}' crossorigin="anonymous"></script>
 </body>
 </html>
