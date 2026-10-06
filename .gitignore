@@ -1,13 +1,15 @@
 # secrets — NEVER commit these
 .streamlit/secrets.toml
 
+# generated expert config (written at runtime)
+vizva_expert_config.json
+
 # python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 env/
-.python-version
 
 # os / editor
 .DS_Store

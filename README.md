@@ -1,114 +1,73 @@
 # Vizva Scheduler
 
-A dedicated Streamlit app that runs the **same solver** as the Vizva dashboard's
-Schedule View and lets you move interview bars **vertically** between expert lanes.
+A dedicated Streamlit app that renders the dashboard's **Schedule View exactly**
+(same code, same UI, same solution) and adds one extra section: a drag board for
+moving interview bars **vertically** between expert lanes.
 
-## What it does
-
-* Loads interviews from the same API endpoint as the dashboard (`/api/app-case`).
-* Runs the identical five-pass solver, in the same order:
-
-  | Pass | Function | Purpose |
-  |------|----------|---------|
-  | P1 | `enforce_presence_first` | move tasks off Absent experts |
-  | P2 | `resolve_clashes` | split overlapping interviews |
-  | P3 | `enforce_gap_policy` | 10-minute minimum gap |
-  | P4 | `optimize_expertise_match` | expertise re-alignment |
-  | P5 | `apply_presence_first_labels` | label Priority-1 moves |
-
-* Renders the resolved Gantt with the dashboard's own renderer, so colours mean
-  the same thing.
-* Adds a **drag board**: every expert is a container, every interview is a card.
-  Drag a card up or down into another expert's lane.
-
-## Why the solution is identical
+## Identical to Schedule View
 
 `scheduler_core.py` is **not** a rewrite. It was machine-extracted from the
-dashboard's `app.py` as a byte-for-byte copy of 36 functions — the solver/render
-seeds plus their full call-dependency closure. The logic cannot drift.
+dashboard's `app.py` as a byte-for-byte copy of **55 functions** — including:
+
+| Included | Purpose |
+|----------|---------|
+| `render_schedule_view` | the whole page |
+| `render_expert_config_panel` | **Expert Expertise & Presence** editor |
+| `render_schedule_gantt`, `render_resolved_gantt` | both Gantt charts |
+| `render_availability_summary` | availability table |
+| `render_resolution_summary` | resolution KPIs |
+| `enforce_presence_first` … `optimize_expertise_match` | P1–P5 solver |
+| `fetch_all_data`, `normalize`, `filter_active_experts` | data pipeline |
+
+The app calls `render_schedule_view(all_case_df, active_expert_df)` — the same
+call, with the same two frames, as the dashboard.
 
 ## Vertical-only, by construction
 
-The time axis is immutable:
-
-* a drag can only change **which expert container** a card sits in — the Y axis;
-* the interview time is **text inside the card**, never editable;
-* no code path writes `start_min` / `end_min` after the solver runs.
-
-After each move the app re-runs validation and warns you about any clash, gap
-violation (< 10 min) or Absent-expert assignment the move created.
+The drag board places each **expert as a container** and each interview as a card
+(`09:00 AM-09:30 AM | Candidate | Company | Round | #12`). A drag can only change
+which container a card sits in. The time is text inside the card, and no code path
+writes `start_min` / `end_min` after the solver runs.
 
 ## Project layout
 
 ```
 vizva-scheduler/
-├── scheduler_app.py                 # the app — run this
-├── scheduler_core.py                # solver, extracted verbatim from app.py
-├── test_scheduler.py                # verification suite (6 checks)
+├── scheduler_app.py                 # run this
+├── scheduler_core.py                # Schedule View, extracted verbatim
+├── test_scheduler.py                # solver verification suite
 ├── requirements.txt
 ├── README.md
 ├── .gitignore
 └── .streamlit/
     ├── config.toml
-    └── secrets.toml.example         # copy to secrets.toml and fill in
+    └── secrets.toml.example
 ```
 
 ## Setup
 
 ```bash
-git clone <your-repo-url>
-cd vizva-scheduler
 pip install -r requirements.txt
-cp .streamlit/secrets.toml.example .streamlit/secrets.toml
-# edit .streamlit/secrets.toml with the real values
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # then edit
 streamlit run scheduler_app.py
 ```
 
-### Secrets
+Secrets (same keys as the dashboard): `API_KEY`, `BASE_URL`,
+`VIZVA_USERNAME`, `VIZVA_PASSWORD`.
 
-Same keys as the dashboard:
+## Deploy
 
-| Key | Purpose |
-|-----|---------|
-| `API_KEY` | sent as the `x-api-key` header on every API call |
-| `BASE_URL` | API host |
-| `VIZVA_USERNAME` | login username (identical to the dashboard) |
-| `VIZVA_PASSWORD` | login password (identical to the dashboard) |
-
-`.streamlit/secrets.toml` is gitignored. Only `secrets.toml.example` is committed.
-
-## Deploy to Streamlit Community Cloud
-
-1. Push this folder to GitHub.
-2. Create a new app; set **Main file path** to `scheduler_app.py`.
-3. Paste the four secrets into the app's **Secrets** box (Advanced settings).
-4. Deploy.
-
-## Tests
-
-```bash
-python3 test_scheduler.py
-```
-
-Expected:
-
-```
-PASS presence: enforce_presence_first cleared the Absent expert
-PASS clashes:   0 overlapping interviews after resolution
-PASS gap rule:  no pair closer than 10 minutes
-PASS vertical-only: expert changed, start/end times byte-identical
-PASS deterministic: identical assignment on a second run
-PASS empty-day guard
-ALL SCHEDULER TESTS PASSED
-```
+Push to GitHub, create a Streamlit Cloud app with **Main file path** =
+`scheduler_app.py`, and paste the four secrets into the app's Secrets box.
 
 ## Notes
 
-* `presence_map` values are the **strings** `"Present"` / `"Absent"` — not booleans.
-  Missing/unknown entries are treated as Present.
-* A stranded Absent expert after the full pipeline is expected behaviour (a clash
-  fix can re-place an interview onto an absent expert); the app surfaces it as a
-  warning, exactly like the dashboard.
-* If `streamlit-sortables` is unavailable, the app falls back to a `st.data_editor`
-  table with a read-only Time column and an Expert dropdown — same vertical-only
-  semantics, without drag.
+* The **Expert Expertise & Presence** panel lives inside Schedule View, exactly
+  as in the dashboard — expand it to set attendance and expertise
+  (Data/Business Analyst, Software Engineer, DevOps/Cyber Security, Unspecified).
+* The config is written to `vizva_expert_config.json` next to the app
+  (gitignored). On Streamlit Cloud this file is per-container and resets on
+  redeploy — use the panel's Download/Restore buttons to keep a copy.
+* `presence_map` values are the **strings** `"Present"` / `"Absent"`.
+* If `streamlit-sortables` is unavailable, the drag board falls back to a table
+  editor with a read-only Time column and an Expert dropdown.
