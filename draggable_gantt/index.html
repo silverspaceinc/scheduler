@@ -62,25 +62,27 @@
   function setValue(v){ post(VALUE,{value:v,dataType:"json"}); }
   post(READY,{apiVersion:1});
 
-  var ARGS={}, EXPERTS=[], drag=null, nonce=0, expanded=false, adjusting=false;
+  var ARGS={}, EXPERTS=[], drag=null, nonce=0, expanded=false, adjustPass=0;
   var ROWH=45, BARH=27;                 // ROWH may be fractional in expanded mode
   var ROW_MIN=24, ROW_MAX=400;
 
   window.addEventListener("message", function(e){
     if(!e.data || e.data.type!==RENDER){ return; }
     ARGS=e.data.args||{};
+    adjustPass=0;
     render();
   });
 
   document.addEventListener("fullscreenchange", function(){
     expanded = !!document.fullscreenElement;
+    adjustPass = 0;
     render();
   });
 
   var _rt=null;
   window.addEventListener("resize", function(){
     if(_rt){ clearTimeout(_rt); }
-    _rt=setTimeout(function(){ render(); }, 100);
+    _rt=setTimeout(function(){ adjustPass=0; render(); }, 100);
   });
 
   function el(cls, txt){
@@ -102,6 +104,7 @@
 
   function toggleExpand(){
     expanded = !expanded;
+    adjustPass = 0;
     var w=document.getElementById("wrap");
     try {
       if(expanded){
@@ -248,7 +251,8 @@
     }
     xa.appendChild(xt);
     W.appendChild(xa);
-    W.appendChild(el("xtitle","Time (EDT)"));
+    var xtitle = el("xtitle","Time (EDT)");
+    W.appendChild(xtitle);
     if(!expanded){
       W.appendChild(el("hint","Drag a bar up or down to another expert lane. Time is locked — only the lane changes."));
     }
@@ -256,23 +260,36 @@
     wrap.appendChild(W);
 
     /* ── size the frame ─────────────────────────────────────────
-       Measure the chrome AFTER the DOM exists, then stretch the lanes
-       to fill the viewport exactly (fractional row height = no leftover). */
+       EXACT fit.  Chrome is measured as
+           (chart top - content top) + (last element bottom - chart bottom)
+       which deliberately EXCLUDES any leftover space below the chart.
+       (The earlier version used wrap.bottom - chart.bottom, which folded
+       the leftover into "chrome" and made the loop converge on a wrong,
+       too-small row height -- that was the blank band at the bottom.) */
     if(expanded){
-      var target=targetHeight();
-      var chrome=W.offsetHeight - plot.offsetHeight;   // measured, not guessed
-      var desiredPlot=target - chrome - 4;             // 4px breathing room
-      if(desiredPlot < n*ROW_MIN){ desiredPlot = n*ROW_MIN; }
-      var newRow=desiredPlot / n;
-      if(newRow>ROW_MAX){ newRow=ROW_MAX; }
-      if(!adjusting && Math.abs(newRow-ROWH)>0.6){
-        ROWH=newRow;
-        adjusting=true;
+      var cs=getComputedStyle(W);
+      var padT=parseFloat(cs.paddingTop)||0;
+      var padB=parseFloat(cs.paddingBottom)||0;
+      var wr=W.getBoundingClientRect();
+      var cr=chart.getBoundingClientRect();
+      var lr=xtitle.getBoundingClientRect();
+
+      var availableInner = wr.height - padT - padB;
+      var chrome = (cr.top - wr.top - padT) + (lr.bottom - cr.bottom);
+      var desiredPlot = availableInner - chrome - 2;   // 2px breathing room
+
+      var minPlot = n*ROW_MIN;
+      if(desiredPlot < minPlot){ desiredPlot = minPlot; }
+      var newRow = desiredPlot / n;
+      if(newRow > ROW_MAX){ newRow = ROW_MAX; }
+
+      if(adjustPass < 3 && Math.abs(newRow - ROWH) > 0.4){
+        ROWH = newRow;
+        adjustPass += 1;
         render();
-        adjusting=false;
         return;
       }
-      setHeight(target);
+      setHeight(Math.ceil(wr.height));
     } else {
       setHeight(W.offsetHeight+30);
     }
@@ -355,6 +372,5 @@
     for(var i=0;i<t.length;i++){ t[i].classList.remove("target"); }
   }
 </script>
-<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","spa":2}' crossorigin="anonymous"></script>
 </body>
 </html>
