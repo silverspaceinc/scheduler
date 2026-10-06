@@ -1,49 +1,91 @@
 """
-Vizva Scheduler v1.1
+Vizva Scheduler v2.1
 
 Renders the dashboard's Schedule View EXACTLY (same code, extracted verbatim
 into scheduler_core.py — including the Expert Expertise & Presence panel and
-the full P1-P5 clash resolution), then adds one extra section: a drag board
-that lets you move interview bars VERTICALLY between expert lanes.
+the full P1-P5 clash resolution), then adds a DRAGGABLE GANTT below it that
+looks like the dashboard's Resolved Expert Schedule chart.
 
-Vertical-only is enforced by construction: a drag changes only which expert
-container a card sits in, and no code path ever writes start_min / end_min.
+The draggable Gantt:
+  * X axis = time (EDT), Y axis = expert lane   — same as the Plotly Gantt
+  * same colours, borders, 8-item legend, shift lines and "Now" marker
+  * every bar is grabbable — drag it UP or DOWN to another expert lane
+  * the bar keeps its exact time: only the lane changes (vertical-only)
+
+The drag is a Streamlit custom component (draggable_gantt/index.html) written
+in vanilla JS, so no npm build is required.
 
 Run:  streamlit run scheduler_app.py
 """
 import json
-from datetime import date
+import os
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 from scheduler_core import (
     fetch_all_data, normalize, filter_current_year, filter_active_experts,
     render_schedule_view, build_schedule_data, load_expert_config,
     get_expertise_map, enforce_presence_first, resolve_clashes,
     enforce_gap_policy, optimize_expertise_match, apply_presence_first_labels,
-    is_present, GAP_MINUTES,
+    is_present, _minutes_to_label, GAP_MINUTES, SHIFT_START_MIN, SHIFT_END_MIN,
 )
 
-try:
-    from streamlit_sortables import sort_items
-    HAS_SORTABLES = True
-except Exception:
-    HAS_SORTABLES = False
+APP_VERSION = "SCHED v2.1 — Gantt-style draggable board"
 
-APP_VERSION = "SCHED v1.1 — full Schedule View + vertical drag"
-
-st.set_page_config(page_title="Vizva Scheduler [v1.1]", page_icon="🗓️", layout="wide")
+st.set_page_config(page_title="Vizva Scheduler [v2.1]", page_icon="🗓️", layout="wide")
 
 API_KEY = st.secrets.get("API_KEY", "")
 BASE_URL = st.secrets.get("BASE_URL", "")
 VIZVA_USERNAME = st.secrets.get("VIZVA_USERNAME", "")
 VIZVA_PASSWORD = st.secrets.get("VIZVA_PASSWORD", "")
 
+# ── the drag component (vanilla JS, no build step) ─────────────────
+_GANTT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "draggable_gantt")
+try:
+    _draggable_gantt = components.declare_component("vizva_draggable_gantt", path=_GANTT_DIR)
+except Exception:
+    _draggable_gantt = None
+
+# ── colours: identical to render_resolved_gantt ────────────────────
+STATUS_COLORS = {"completed": "#2ecc71", "rescheduled": "#f39c12",
+                 "cancelled": "#e74c3c", "pending": "#3498db"}
+REASSIGNED_COLOR = "#1abc9c"
+UNRESOLVED_COLOR = "#c0392b"
+EXPERTISE_COLOR = "#9b59b6"
+ABSENT_COLOR = "#e67e22"
+
+LEGEND = [
+    {"label": "Completed", "color": "#2ecc71", "border": "white", "width": 1},
+    {"label": "Rescheduled", "color": "#f39c12", "border": "white", "width": 1},
+    {"label": "Cancelled", "color": "#e74c3c", "border": "white", "width": 1},
+    {"label": "Pending", "color": "#3498db", "border": "white", "width": 1},
+    {"label": "Reassigned (teal/green)", "color": "#1abc9c", "border": "#27ae60", "width": 3},
+    {"label": "Unresolved (no free expert)", "color": "#c0392b", "border": "#ff0000", "width": 4},
+    {"label": "Expertise re-aligned (P4)", "color": "#9b59b6", "border": "#8e44ad", "width": 3},
+    {"label": "Moved off Absent expert (P1 - presence)", "color": "#e67e22",
+     "border": "#d35400", "width": 3},
+]
+
+
+def _bar_style(row):
+    """(fill, border, border_width) — the same mapping render_resolved_gantt uses."""
+    action = str(row.get("resolution_action", "kept") or "kept")
+    if action in ("presence_reassigned", "absent_reassigned"):
+        return ABSENT_COLOR, "#d35400", 3
+    if action == "expertise_reassigned":
+        return EXPERTISE_COLOR, "#8e44ad", 3
+    if action in ("reassigned", "gap_reassigned"):
+        return REASSIGNED_COLOR, "#27ae60", 3
+    if action == "unresolved":
+        return UNRESOLVED_COLOR, "#ff0000", 4
+    return STATUS_COLORS.get(str(row.get("task_status", "")), "#95a5a6"), "white", 1
+
 
 @st.cache_data(ttl=600, show_spinner="Loading interviews...")
-def load_frames(pipeline_version="sched-v1.1"):
+def load_frames(pipeline_version="sched-v2.1"):
     """Same pipeline as the dashboard: all_case_df + active_expert_df."""
     raw = fetch_all_data()
     if raw is None or raw.empty:
@@ -56,8 +98,7 @@ def load_frames(pipeline_version="sched-v1.1"):
         self_mask = raw["expert_name"].str.strip().str.lower() == "self"
         if "task_status" in raw.columns:
             raw.loc[self_mask, "task_status"] = "completed"
-        fb = ("This Interview is given by Candidate himself and so "
-              "no support was required.")
+        fb = "This Interview is given by Candidate himself and so no support was required."
         for col in ["feedback", "expert_feedback", "client_feedback"]:
             if col in raw.columns:
                 raw.loc[self_mask, col] = fb
@@ -89,6 +130,7 @@ def solve(sched, all_expert_names, expertise_map, presence_map, round_map,
 
 
 def validate(resolved, presence_map):
+    """Clash / 10-minute gap / absent-expert checks on the current assignment."""
     problems = []
     if resolved is None or resolved.empty:
         return problems
@@ -119,81 +161,95 @@ def validate(resolved, presence_map):
     return problems
 
 
-def card_text(row):
-    return "%s-%s | %s | %s | %s | #%d" % (
-        row.get("start_label", "?"), row.get("end_label", "?"),
-        str(row.get("candidate_name", ""))[:26],
-        str(row.get("company_name", ""))[:20],
-        str(row.get("round_name", ""))[:22], int(row["row_id"]))
+def _hover(row):
+    action = str(row.get("resolution_action", "kept") or "kept")
+    original = row.get("original_expert", row.get("expert_name", ""))
+    tag = ""
+    if action == "reassigned":
+        tag = " | Reassigned from " + str(original)
+    elif action == "gap_reassigned":
+        tag = " | Gap-moved (10-min rule) from " + str(original)
+    elif action == "expertise_reassigned":
+        tag = " | Expertise re-aligned (P4) from " + str(original)
+    elif action in ("presence_reassigned", "absent_reassigned"):
+        tag = " | Moved off Absent expert " + str(original) + " (P1)"
+    elif action == "unresolved":
+        tag = " | UNRESOLVED - no free expert"
+    return "%s | %s | %s | %s-%s | %s min%s" % (
+        row.get("candidate_name", ""), row.get("company_name", ""),
+        row.get("round_name", ""), row.get("start_label", ""), row.get("end_label", ""),
+        row.get("duration", ""), tag)
 
 
-def parse_card_id(text):
-    try:
-        return int(str(text).rsplit("#", 1)[1].strip())
-    except Exception:
+def render_draggable_gantt(resolved, all_expert_names, selected_date, overrides):
+    """The draggable Gantt, styled like the dashboard's Resolved Gantt."""
+    if _draggable_gantt is None:
+        st.warning("Drag component not found. Expected the folder "
+                   "`draggable_gantt/` next to scheduler_app.py.")
         return None
 
-
-def render_drag_board(resolved, all_expert_names, overrides):
     df = resolved.copy().reset_index(drop=True)
     df["row_id"] = range(len(df))
-    lanes = list(all_expert_names)
-    for e in df["expert_name"].dropna().unique():
-        e = str(e)
-        if e not in lanes and e.strip().lower() not in ("hcr", "self"):
-            lanes.append(e)
-    containers = []
-    for lane in lanes:
-        sub = df[df["expert_name"].astype(str) == lane].sort_values("start_min")
-        containers.append({"header": lane,
-                           "items": [card_text(r) for _, r in sub.iterrows()]})
-    if not containers:
-        return overrides
-    try:
-        result = sort_items(containers, multi_containers=True)
-    except TypeError:
-        result = sort_items(containers, multi_containers=True)
-    new_ov = dict(overrides)
-    if isinstance(result, list):
-        for cont in result:
-            if not isinstance(cont, dict):
-                continue
-            lane = str(cont.get("header", ""))
-            for item in cont.get("items", []):
-                rid = parse_card_id(item)
-                if rid is not None and lane:
-                    new_ov[rid] = lane
-    return new_ov
+    df = df[~df["expert_name"].astype(str).str.strip().str.lower().eq("self")]
 
+    # expert order: those holding interviews (by earliest start), then the rest
+    experts_with = (df.groupby("expert_name")["start_min"].min()
+                    .sort_values().index.tolist())
+    extras = [e for e in all_expert_names
+              if e not in experts_with and str(e).strip().lower() != "self"]
+    expert_order = experts_with + sorted(extras)
+    if not expert_order:
+        st.info("No experts to show on the drag board.")
+        return None
 
-def render_fallback_editor(resolved, all_expert_names, overrides):
-    df = resolved.copy().reset_index(drop=True)
-    df["row_id"] = range(len(df))
-    df = df.sort_values(["expert_name", "start_min"])
-    view = pd.DataFrame({
-        "row_id": df["row_id"].values,
-        "Time": df["start_label"].astype(str).values,
-        "Candidate": df["candidate_name"].astype(str).values,
-        "Company": df["company_name"].astype(str).values,
-        "Round": df["round_name"].astype(str).values,
-        "Expert": df["expert_name"].astype(str).values,
-    })
-    edited = st.data_editor(
-        view, hide_index=True, use_container_width=True, key="fallback_editor",
-        column_config={
-            "row_id": st.column_config.NumberColumn("row_id", disabled=True),
-            "Time": st.column_config.TextColumn("Time", disabled=True,
-                                                help="Locked - vertical moves only"),
-            "Candidate": st.column_config.TextColumn("Candidate", disabled=True),
-            "Company": st.column_config.TextColumn("Company", disabled=True),
-            "Round": st.column_config.TextColumn("Round", disabled=True),
-            "Expert": st.column_config.SelectboxColumn("Expert",
-                                                       options=list(all_expert_names)),
+    if df.empty:
+        tmin, tmax = 480.0, 1080.0
+    else:
+        tmin = float(max(0, int(df["start_min"].min()) - 30))
+        tmax = float(min(1440, int(df["end_min"].max()) + 30))
+    span = max(tmax - tmin, 1.0)
+
+    rows = []
+    for _, r in df.iterrows():
+        fill, border, bwidth = _bar_style(r)
+        width_pct = (float(r["end_min"]) - float(r["start_min"])) / span * 100.0
+        short = ""
+        if width_pct >= 6.0:
+            short = str(r.get("candidate_name", ""))[:16]
+        elif width_pct >= 3.5:
+            short = str(r.get("candidate_name", ""))[:6]
+        rows.append({
+            "row_id": int(r["row_id"]),
+            "expert": str(r["expert_name"]),
+            "start_min": float(r["start_min"]),
+            "end_min": float(r["end_min"]),
+            "color": fill,
+            "border": border,
+            "border_width": bwidth,
+            "short": short,
+            "hover": _hover(r),
         })
-    new_ov = dict(overrides)
-    for _, r in edited.iterrows():
-        new_ov[int(r["row_id"])] = str(r["Expert"])
-    return new_ov
+
+    ticks = []
+    t = int(tmin // 30 * 30)
+    while t <= tmax:
+        ticks.append({"min": t, "label": _minutes_to_label(t)})
+        t += 30
+
+    now_min = None
+    try:
+        now_edt = datetime.now(timezone(timedelta(hours=-4)))
+        if selected_date == now_edt.date():
+            now_min = now_edt.hour * 60 + now_edt.minute
+    except Exception:
+        now_min = None
+
+    return _draggable_gantt(
+        rows=rows, experts=expert_order, legend=LEGEND,
+        title="🧠 Resolved Expert Schedule — " + str(selected_date) + " (EDT)",
+        tmin=tmin, tmax=tmax, ticks=ticks,
+        now_min=now_min, shift_start=SHIFT_START_MIN, shift_end=SHIFT_END_MIN,
+        key="drag_gantt", default=None)
 
 
 def main():
@@ -209,22 +265,21 @@ def main():
 
     # ══════════════════════════════════════════════════════════════
     #  THE DASHBOARD'S SCHEDULE VIEW, UNCHANGED
-    #  (includes the Expert Expertise & Presence panel and the full
-    #   P1-P5 Intelligent Clash Resolution)
     # ══════════════════════════════════════════════════════════════
     render_schedule_view(all_case_df, active_expert_df)
 
     # ══════════════════════════════════════════════════════════════
-    #  ADD-ON: manual vertical lane adjustment
+    #  ADD-ON: DRAGGABLE GANTT — drag a bar up/down to another expert
     # ══════════════════════════════════════════════════════════════
     st.markdown("---")
-    st.header("✋ Manual Lane Adjustment (vertical moves only)")
-    st.caption("Drag a card up or down into another expert's lane. The time on the card is "
-               "locked - this board cannot change when an interview happens, only who covers it.")
+    st.header("✋ Manual Lane Adjustment — drag a bar up or down")
+    st.caption("Same chart as the Resolved Expert Schedule above, but every bar is grabbable. "
+               "Drag a bar up or down into another expert's lane — the bar keeps its exact time, "
+               "so only the expert changes. Bars you move get a cyan outline.")
 
     selected_date = st.session_state.get("schedule_date", date.today())
     sched = build_schedule_data(all_case_df, selected_date)
-    if sched.empty:
+    if sched is None or sched.empty:
         st.info("No interviews with valid time data on " + str(selected_date) + ".")
         return
 
@@ -254,10 +309,12 @@ def main():
         st.session_state["overrides"] = {}
     overrides = st.session_state["overrides"]
 
+    # apply manual moves (lane only — time is never touched)
     if overrides:
         moved = resolved["row_id"].map(lambda r: overrides.get(int(r)))
         mask = moved.notna()
         resolved.loc[mask, "expert_name"] = moved[mask]
+        resolved.loc[mask, "manual_move"] = True
 
     k = st.columns(4)
     k[0].metric("Interviews", len(resolved))
@@ -265,6 +322,19 @@ def main():
     k[2].metric("Manually Moved", len(overrides))
     k[3].metric("Clash Flags", int(resolved["has_clash"].sum())
                 if "has_clash" in resolved.columns else 0)
+
+    event = render_draggable_gantt(resolved, all_expert_names, selected_date, overrides)
+
+    if isinstance(event, dict) and event.get("row_id") is not None:
+        if event.get("nonce") != st.session_state.get("drag_nonce"):
+            st.session_state["drag_nonce"] = event.get("nonce")
+            rid = int(event["row_id"])
+            to = str(event.get("to"))
+            if to == str(event.get("from")):
+                st.session_state["overrides"].pop(rid, None)
+            else:
+                st.session_state["overrides"][rid] = to
+            st.rerun()
 
     problems = validate(resolved, presence_map)
     if problems:
@@ -278,21 +348,6 @@ def main():
                        "\n".join("- " + m for m in msgs[:8]))
     else:
         st.success("No clashes, gap violations or absent-expert assignments on this date.")
-
-    if HAS_SORTABLES:
-        before = dict(overrides)
-        after = render_drag_board(resolved, all_expert_names, overrides)
-        if after != before:
-            st.session_state["overrides"] = after
-            st.rerun()
-    else:
-        st.info("`streamlit-sortables` is not installed - using the table editor below. "
-                "Install it with `pip install streamlit-sortables` for drag-and-drop.")
-        before = dict(overrides)
-        after = render_fallback_editor(resolved, all_expert_names, overrides)
-        if after != before:
-            st.session_state["overrides"] = after
-            st.rerun()
 
     a, b = st.columns([1, 3])
     with a:
