@@ -16,27 +16,40 @@
   .legend { display:flex; flex-wrap:wrap; gap:4px 14px; justify-content:center;
     margin:0 0 6px 0; font-size:11px; }
   .li { display:flex; align-items:center; gap:6px; white-space:nowrap; }
-  .sw { width:14px; height:12px; border-radius:2px; display:inline-block; flex:none; }
+  .sw { width:14px; height:12px; border-radius:2px; display:inline-block; flex:none; box-sizing:border-box; }
   .chart { display:flex; }
   .ylabel { width:22px; display:flex; align-items:center; justify-content:center;
     font-size:12px; opacity:.85; flex:none; }
   .ylabel span { transform:rotate(-90deg); white-space:nowrap; }
   .grid { flex:1; display:flex; min-width:0; }
-  .gutter { width:150px; flex:none; }
-  .gname { padding-left:8px; font-size:11.5px;
+  .gutter { position:relative; width:150px; flex:none; }
+  .gname { position:absolute; left:0; right:0; display:flex; align-items:center;
+    padding-left:8px; box-sizing:border-box; font-size:11.5px;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:.95; }
+  .gname.status { font-weight:600; }
+  .gname.k-u { color:#cfd8dc; } .gname.k-r { color:#f5b041; } .gname.k-c { color:#f1948a; }
+  .gsep { position:absolute; left:0; right:0; display:flex; align-items:flex-end;
+    padding:0 0 2px 8px; box-sizing:border-box; font-size:9.5px; letter-spacing:.06em;
+    text-transform:uppercase; opacity:.55; }
   .plot { position:relative; flex:1; border-left:1px solid rgba(128,128,128,.35);
     border-bottom:1px solid rgba(128,128,128,.35); min-width:0; }
-  .lane { position:absolute; left:0; right:0;
+  .lane { position:absolute; left:0; right:0; box-sizing:border-box;
     border-bottom:1px solid rgba(128,128,128,.14); }
-  .lane.target { background:rgba(46,204,113,.18); }
-  .vline { position:absolute; top:0; bottom:0; width:0; }
-  .bar { position:absolute; border-radius:3px; overflow:hidden;
-    white-space:nowrap; font-size:10px; padding:0 6px; color:#fff;
+  .lane.k-u { background:rgba(149,165,166,.10); }
+  .lane.k-r { background:rgba(243,156,18,.10); }
+  .lane.k-c { background:rgba(231,76,60,.10); }
+  .lane.target { background:rgba(46,204,113,.22) !important; }
+  .sep { position:absolute; left:0; right:0; border-top:1px dashed rgba(200,200,200,.35);
+    background:rgba(0,0,0,.18); }
+  .vline { position:absolute; top:0; bottom:0; width:0; pointer-events:none; }
+  .bar { position:absolute; border-radius:3px; overflow:hidden; box-sizing:border-box;
+    white-space:nowrap; font-size:10px; padding:0 6px; color:#fff; z-index:10;
     cursor:grab; touch-action:none; user-select:none; -webkit-user-select:none; }
-  .bar:hover { filter:brightness(1.15); }
-  .bar.dragging { cursor:grabbing; z-index:30; opacity:.95;
+  .bar:hover { filter:brightness(1.15); z-index:15; }
+  .bar.clash { box-shadow:0 0 0 2px #ff3b3b, 0 0 8px rgba(255,59,59,.7); }
+  .bar.dragging { cursor:grabbing; z-index:40; opacity:.95;
     box-shadow:0 8px 20px rgba(0,0,0,.6); }
+  .bar.pending { opacity:.55; }
   .bar span { pointer-events:none; }
   .xaxis { display:flex; }
   .xspacer { width:172px; flex:none; }
@@ -60,29 +73,56 @@
   }
   function setHeight(h){ post(HEIGHT,{height:Math.ceil(h)}); }
   function setValue(v){ post(VALUE,{value:v,dataType:"json"}); }
+  function uid(){ return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2,10); }
   post(READY,{apiVersion:1});
 
-  var ARGS={}, EXPERTS=[], drag=null, nonce=0, expanded=false, adjustPass=0;
-  var ROWH=45, BARH=27;                 // ROWH may be fractional in expanded mode
-  var ROW_MIN=24, ROW_MAX=400;
+  var ARGS={}, LANES=[], drag=null, expanded=false, adjustPass=0, pendingArgs=null;
+  var ROWH_BASE=45, ROWH=45, BARH=27, ROW_MIN=24, ROW_MAX=400, SEP=22;
+  var LT=[], LH=[], LANE_ELS=[];
+  var KIND_CLASS={"__UNASSIGNED__":"k-u","__RESCHEDULED__":"k-r","__CANCELLED__":"k-c"};
 
+  /* ── pure helpers (unit-tested) ─────────────────────────────── */
+  function packTracks(bars){
+    /* Greedy interval partitioning: overlapping bars get separate tracks,
+       so no bar is ever hidden behind another. Returns the track count. */
+    bars.sort(function(a,b){ return (a.start_min-b.start_min) || (a.end_min-b.end_min); });
+    var ends=[];
+    for(var i=0;i<bars.length;i++){
+      var b=bars[i], t=-1;
+      for(var k=0;k<ends.length;k++){ if(ends[k] <= b.start_min){ t=k; break; } }
+      if(t<0){ t=ends.length; ends.push(b.end_min); } else { ends[t]=b.end_min; }
+      b._track=t;
+    }
+    return Math.max(1, ends.length);
+  }
+  function laneAt(y, tops, heights){
+    /* Lane index under a y offset; outside any lane -> nearest lane. */
+    var best=0, bestD=Infinity;
+    for(var i=0;i<tops.length;i++){
+      var a=tops[i], b=tops[i]+heights[i];
+      if(y>=a && y<b){ return i; }
+      var d = (y<a) ? (a-y) : (y-b);
+      if(d<bestD){ bestD=d; best=i; }
+    }
+    return best;
+  }
+
+  /* ── Streamlit wiring ───────────────────────────────────────── */
   window.addEventListener("message", function(e){
     if(!e.data || e.data.type!==RENDER){ return; }
-    ARGS=e.data.args||{};
-    adjustPass=0;
-    render();
+    var a=e.data.args||{};
+    if(drag){ pendingArgs=a; return; }      // never rebuild mid-drag (auto-refresh safe)
+    ARGS=a; adjustPass=0; render();
   });
-
   document.addEventListener("fullscreenchange", function(){
     expanded = !!document.fullscreenElement;
-    adjustPass = 0;
-    render();
+    adjustPass=0;
+    if(!drag){ render(); }
   });
-
   var _rt=null;
   window.addEventListener("resize", function(){
     if(_rt){ clearTimeout(_rt); }
-    _rt=setTimeout(function(){ adjustPass=0; render(); }, 100);
+    _rt=setTimeout(function(){ if(!drag){ adjustPass=0; render(); } }, 100);
   });
 
   function el(cls, txt){
@@ -92,202 +132,163 @@
     return d;
   }
 
-  /* The component lives in an iframe. Use the PARENT viewport height when it is
-     readable (same origin), otherwise fall back to our own viewport / screen. */
-  function targetHeight(){
-    var h=0;
-    try { h = (window.parent && window.parent.innerHeight) ? window.parent.innerHeight : 0; } catch(e){ h=0; }
-    if(!h){ h = window.innerHeight || 0; }
-    if(!h){ h = (window.screen && window.screen.height) ? window.screen.height : 800; }
-    return h;
-  }
-
   function toggleExpand(){
-    expanded = !expanded;
-    adjustPass = 0;
+    expanded=!expanded;
+    adjustPass=0;
     var w=document.getElementById("wrap");
     try {
-      if(expanded){
-        if(w && w.requestFullscreen){ w.requestFullscreen(); }
-      } else if(document.fullscreenElement && document.exitFullscreen){
-        document.exitFullscreen();
-      }
+      if(expanded){ if(w && w.requestFullscreen){ w.requestFullscreen(); } }
+      else if(document.fullscreenElement && document.exitFullscreen){ document.exitFullscreen(); }
     } catch(err){}
     render();
-    if(expanded){
-      try { if(w && w.scrollIntoView){ w.scrollIntoView({block:"start"}); } } catch(e){}
-    }
   }
 
   function render(){
     var wrap=document.getElementById("wrap");
-    var rows=ARGS.rows||[];
     wrap.innerHTML="";
-    if(!rows.length){
-      wrap.appendChild(el("empty","No interviews with valid time data for this date."));
+    LANES=ARGS.lanes||[];
+    var rows=ARGS.rows||[];
+    if(!LANES.length){
+      wrap.appendChild(el("empty","No lanes to show for this date."));
       setHeight(50); return;
     }
-    EXPERTS=ARGS.experts||[];
-    var n=Math.max(1, EXPERTS.length);
+    var n=LANES.length, i;
 
-    if(!expanded && ROWH!==45){ ROWH=45; }
-    BARH=Math.max(12, Math.min(ROWH*0.6, 60));
+    /* bars per lane + stacking tracks */
+    var idx={};
+    for(i=0;i<n;i++){ idx[LANES[i].key]=i; }
+    var per=[];
+    for(i=0;i<n;i++){ per.push([]); }
+    for(var r=0;r<rows.length;r++){
+      var li=idx[rows[r].lane];
+      if(li!==undefined){ per[li].push(rows[r]); }
+    }
+    var tracks=[], units=0;
+    for(i=0;i<n;i++){ var tc=packTracks(per[i]); tracks.push(tc); units+=tc; }
+
+    var firstStatus=-1;
+    for(i=0;i<n;i++){ if(LANES[i].kind==="status"){ firstStatus=i; break; } }
+    var sepH=(firstStatus>0)?SEP:0;
+
+    if(!expanded){ ROWH=ROWH_BASE; }
+    BARH=Math.max(12, Math.min(Math.round(ROWH*0.62), 60));
+
+    /* lane geometry (shared by drawing AND the drop hit-test) */
+    LT=[]; LH=[];
+    var y=0, sepTop=-1;
+    for(i=0;i<n;i++){
+      if(i===firstStatus && sepH){ sepTop=y; y+=sepH; }
+      LT.push(y); LH.push(tracks[i]*ROWH); y+=tracks[i]*ROWH;
+    }
+    var plotH=y;
 
     var tmin=ARGS.tmin, tmax=ARGS.tmax;
-    if(tmax<=tmin){ tmax=tmin+1; }
+    if(!(tmax>tmin)){ tmax=tmin+1; }
     var span=tmax-tmin;
 
-    var W=el("wrap"); W.className = expanded ? "wrap fs" : "wrap";
+    var W=el("wrap"); W.className=expanded?"wrap fs":"wrap";
 
     var hdr=el("hdr");
     hdr.appendChild(el("title", ARGS.title||"Resolved Expert Schedule"));
     var btn=document.createElement("button");
     btn.className="expbtn";
-    btn.textContent = expanded ? "⛶ Restore" : "⛶ Expand to full screen";
+    btn.textContent=expanded?"⛶ Restore":"⛶ Expand to full screen";
     btn.addEventListener("click", toggleExpand);
     hdr.appendChild(btn);
     W.appendChild(hdr);
 
     var lg=el("legend");
     var items=ARGS.legend||[];
-    for(var i=0;i<items.length;i++){
-      var li=el("li");
-      var sw=el("sw");
+    for(i=0;i<items.length;i++){
+      var lgi=el("li"), sw=el("sw");
       sw.style.background=items[i].color;
-      if(items[i].border){
-        sw.style.border=items[i].width+"px solid "+items[i].border;
-        sw.style.boxSizing="border-box";
-      }
-      li.appendChild(sw);
-      li.appendChild(document.createTextNode(items[i].label));
-      lg.appendChild(li);
+      if(items[i].border){ sw.style.border=items[i].width+"px solid "+items[i].border; }
+      lgi.appendChild(sw);
+      lgi.appendChild(document.createTextNode(items[i].label));
+      lg.appendChild(lgi);
     }
     W.appendChild(lg);
 
     var chart=el("chart");
-    var yl=el("ylabel"); yl.appendChild(document.createElement("span"));
-    yl.firstChild.textContent="Expert";
+    var yl=el("ylabel"); var ys=document.createElement("span"); ys.textContent="Expert"; yl.appendChild(ys);
     chart.appendChild(yl);
 
     var grid=el("grid");
-    var gutter=el("gutter");
-    for(var g=0; g<EXPERTS.length; g++){
-      var gn=el("gname", EXPERTS[g]);
-      gn.title=EXPERTS[g];
-      gn.style.height=ROWH+"px";
-      gn.style.lineHeight=ROWH+"px";
+    var gutter=el("gutter"); gutter.style.height=plotH+"px";
+    for(i=0;i<n;i++){
+      var kc=KIND_CLASS[LANES[i].key]||"";
+      var gn=el("gname"+(LANES[i].kind==="status"?" status "+kc:""), LANES[i].label);
+      gn.title=LANES[i].label;
+      gn.style.top=LT[i]+"px"; gn.style.height=LH[i]+"px";
       gutter.appendChild(gn);
+    }
+    if(sepTop>=0){
+      var gs=el("gsep","Status lanes");
+      gs.style.top=sepTop+"px"; gs.style.height=sepH+"px";
+      gutter.appendChild(gs);
     }
     grid.appendChild(gutter);
 
-    var plot=el("plot");
-    plot.style.height=(n*ROWH)+"px";
-
+    var plot=el("plot"); plot.style.height=plotH+"px";
+    LANE_ELS=[];
+    for(i=0;i<n;i++){
+      var lane=el("lane "+(KIND_CLASS[LANES[i].key]||""));
+      lane.style.top=LT[i]+"px"; lane.style.height=LH[i]+"px";
+      plot.appendChild(lane); LANE_ELS.push(lane);
+    }
+    if(sepTop>=0){
+      var sp=el("sep"); sp.style.top=sepTop+"px"; sp.style.height=sepH+"px";
+      plot.appendChild(sp);
+    }
     var ticks=ARGS.ticks||[];
-    for(var t=0;t<ticks.length;t++){
-      var pct=(ticks[t].min-tmin)/span*100;
-      if(pct<0||pct>100){ continue; }
-      var vl=el("vline");
-      vl.style.left=pct+"%";
-      vl.style.borderLeft="1px solid rgba(128,128,128,.18)";
-      plot.appendChild(vl);
+    function vline(minute, css, z){
+      var p=(minute-tmin)/span*100;
+      if(!(p>=0 && p<=100)){ return; }
+      var v=el("vline"); v.style.left=p+"%"; v.style.borderLeft=css;
+      if(z){ v.style.zIndex=z; }
+      plot.appendChild(v);
     }
-    if(ARGS.shift_start!==null && ARGS.shift_start!==undefined){
-      var sp=(ARGS.shift_start-tmin)/span*100;
-      if(sp>=0&&sp<=100){
-        var sv=el("vline"); sv.style.left=sp+"%";
-        sv.style.borderLeft="2px dashed #2ecc71"; sv.style.opacity=".6";
-        plot.appendChild(sv);
-      }
-    }
-    if(ARGS.shift_end!==null && ARGS.shift_end!==undefined){
-      var ep=(ARGS.shift_end-tmin)/span*100;
-      if(ep>=0&&ep<=100){
-        var ev=el("vline"); ev.style.left=ep+"%";
-        ev.style.borderLeft="2px dashed #2ecc71"; ev.style.opacity=".6";
-        plot.appendChild(ev);
-      }
-    }
-    if(ARGS.now_min!==null && ARGS.now_min!==undefined){
-      var np=(ARGS.now_min-tmin)/span*100;
-      if(np>=0&&np<=100){
-        var nv=el("vline"); nv.style.left=np+"%";
-        nv.style.borderLeft="2px dashed #FF00FF"; nv.style.zIndex="5";
-        plot.appendChild(nv);
-      }
-    }
-    for(var L=0; L<n; L++){
-      var lane=el("lane");
-      lane.style.top=(L*ROWH)+"px";
-      lane.style.height=ROWH+"px";
-      lane.setAttribute("data-index",String(L));
-      plot.appendChild(lane);
-    }
-    var byExpert={};
-    for(var r=0;r<rows.length;r++){
-      var ex=rows[r].expert;
-      if(!byExpert[ex]){ byExpert[ex]=[]; }
-      byExpert[ex].push(rows[r]);
-    }
-    for(var x=0;x<n;x++){
-      var items2=byExpert[EXPERTS[x]]||[];
-      for(var b=0;b<items2.length;b++){
-        plot.appendChild(makeBar(items2[b], EXPERTS[x], tmin, span, x));
-      }
+    for(i=0;i<ticks.length;i++){ vline(ticks[i].min, "1px solid rgba(128,128,128,.18)", 1); }
+    if(ARGS.shift_start!==null && ARGS.shift_start!==undefined){ vline(ARGS.shift_start, "2px dashed rgba(46,204,113,.6)", 2); }
+    if(ARGS.shift_end!==null && ARGS.shift_end!==undefined){ vline(ARGS.shift_end, "2px dashed rgba(46,204,113,.6)", 2); }
+    if(ARGS.now_min!==null && ARGS.now_min!==undefined){ vline(ARGS.now_min, "2px dashed #FF00FF", 20); }
+
+    for(i=0;i<n;i++){
+      for(var b=0;b<per[i].length;b++){ plot.appendChild(makeBar(per[i][b], i, tmin, span)); }
     }
     grid.appendChild(plot);
     chart.appendChild(grid);
     W.appendChild(chart);
 
-    var xa=el("xaxis");
-    xa.appendChild(el("xspacer"));
+    var xa=el("xaxis"); xa.appendChild(el("xspacer"));
     var xt=el("xticks");
-    for(var q=0;q<ticks.length;q++){
-      var tp=(ticks[q].min-tmin)/span*100;
-      if(tp<0||tp>100){ continue; }
-      var td=el("xt", ticks[q].label);
-      td.style.left=tp+"%";
-      xt.appendChild(td);
+    for(i=0;i<ticks.length;i++){
+      var tp=(ticks[i].min-tmin)/span*100;
+      if(!(tp>=0 && tp<=100)){ continue; }
+      var td=el("xt", ticks[i].label); td.style.left=tp+"%"; xt.appendChild(td);
     }
     xa.appendChild(xt);
     W.appendChild(xa);
-    var xtitle = el("xtitle","Time (EDT)");
+    var xtitle=el("xtitle","Time (EDT)");
     W.appendChild(xtitle);
     if(!expanded){
-      W.appendChild(el("hint","Drag a bar up or down to another expert lane. Time is locked — only the lane changes."));
+      W.appendChild(el("hint","Drag a bar up or down to another lane. Time is locked — only the lane changes. Overlapping bars stack instead of hiding; a red ring marks an overlap."));
     }
-
     wrap.appendChild(W);
 
-    /* ── size the frame ─────────────────────────────────────────
-       EXACT fit.  Chrome is measured as
-           (chart top - content top) + (last element bottom - chart bottom)
-       which deliberately EXCLUDES any leftover space below the chart.
-       (The earlier version used wrap.bottom - chart.bottom, which folded
-       the leftover into "chrome" and made the loop converge on a wrong,
-       too-small row height -- that was the blank band at the bottom.) */
+    /* exact full-screen fit: chrome = above chart + below chart (never the leftover) */
     if(expanded){
       var cs=getComputedStyle(W);
-      var padT=parseFloat(cs.paddingTop)||0;
-      var padB=parseFloat(cs.paddingBottom)||0;
-      var wr=W.getBoundingClientRect();
-      var cr=chart.getBoundingClientRect();
-      var lr=xtitle.getBoundingClientRect();
-
-      var availableInner = wr.height - padT - padB;
-      var chrome = (cr.top - wr.top - padT) + (lr.bottom - cr.bottom);
-      var desiredPlot = availableInner - chrome - 2;   // 2px breathing room
-
-      var minPlot = n*ROW_MIN;
-      if(desiredPlot < minPlot){ desiredPlot = minPlot; }
-      var newRow = desiredPlot / n;
-      if(newRow > ROW_MAX){ newRow = ROW_MAX; }
-
-      if(adjustPass < 3 && Math.abs(newRow - ROWH) > 0.4){
-        ROWH = newRow;
-        adjustPass += 1;
-        render();
-        return;
+      var padT=parseFloat(cs.paddingTop)||0, padB=parseFloat(cs.paddingBottom)||0;
+      var wr=W.getBoundingClientRect(), cr=chart.getBoundingClientRect(), lr=xtitle.getBoundingClientRect();
+      var availableInner=wr.height-padT-padB;
+      var chrome=(cr.top-wr.top-padT)+(lr.bottom-cr.bottom);
+      var desired=availableInner-chrome-2-sepH;
+      if(desired<units*ROW_MIN){ desired=units*ROW_MIN; }
+      var newRow=desired/units;
+      if(newRow>ROW_MAX){ newRow=ROW_MAX; }
+      if(adjustPass<3 && Math.abs(newRow-ROWH)>0.4){
+        ROWH=newRow; adjustPass+=1; render(); return;
       }
       setHeight(Math.ceil(wr.height));
     } else {
@@ -295,7 +296,7 @@
     }
   }
 
-  function makeBar(item, expert, tmin, span, laneIdx){
+  function makeBar(item, laneIdx, tmin, span){
     var bar=el("bar");
     var left=(item.start_min-tmin)/span*100;
     var width=(item.end_min-item.start_min)/span*100;
@@ -304,73 +305,57 @@
     bar.style.width=width+"%";
     bar.style.height=BARH+"px";
     bar.style.lineHeight=(BARH-2)+"px";
-    bar.style.top=(laneIdx*ROWH+(ROWH-BARH)/2)+"px";
+    bar.style.top=(LT[laneIdx]+(item._track||0)*ROWH+(ROWH-BARH)/2)+"px";
     bar.style.background=item.color||"#2ecc71";
-    if(item.border){
-      bar.style.border=(item.border_width||1)+"px solid "+item.border;
-      bar.style.boxSizing="border-box";
-    }
-    var lbl=document.createElement("span");
-    lbl.textContent=item.short||"";
-    bar.appendChild(lbl);
+    if(item.border){ bar.style.border=(item.border_width||1)+"px solid "+item.border; }
+    if(item.clash){ bar.classList.add("clash"); }
+    var lbl=document.createElement("span"); lbl.textContent=item.short||""; bar.appendChild(lbl);
     bar.title=item.hover||"";
-    bar.setAttribute("data-row-id",String(item.row_id));
-    bar.addEventListener("pointerdown",function(ev){ onDown(ev,bar,item,expert,laneIdx); });
-    bar.addEventListener("pointermove",onMove);
-    bar.addEventListener("pointerup",onUp);
-    bar.addEventListener("pointercancel",onUp);
+    bar.addEventListener("pointerdown", function(ev){ onDown(ev, bar, item, laneIdx); });
+    bar.addEventListener("pointermove", onMove);
+    bar.addEventListener("pointerup", onUp);
+    bar.addEventListener("pointercancel", onCancel);
     return bar;
   }
 
-  function onDown(ev,bar,item,expert,laneIdx){
+  function onDown(ev, bar, item, laneIdx){
+    if(ev.pointerType==="mouse" && ev.button!==0){ return; }
     ev.preventDefault();
     try{ bar.setPointerCapture(ev.pointerId); }catch(e){}
-    drag={bar:bar,item:item,from:expert,laneIdx:laneIdx,startY:ev.clientY,
-          moved:false,target:expert};
+    drag={bar:bar, item:item, fromKey:LANES[laneIdx].key, startY:ev.clientY, moved:false, target:laneIdx};
     bar.classList.add("dragging");
   }
-
   function onMove(ev){
     if(!drag){ return; }
     var dy=ev.clientY-drag.startY;
-    if(Math.abs(dy)>2){ drag.moved=true; }
+    if(Math.abs(dy)>3){ drag.moved=true; }
     drag.bar.style.transform="translateY("+dy+"px)";
-    var idx=indexFromY(ev.clientY);
-    drag.target=EXPERTS[idx];
-    highlight(idx);
+    var plot=document.querySelector(".plot");
+    if(!plot){ return; }
+    var rect=plot.getBoundingClientRect();
+    drag.target=laneAt(ev.clientY-rect.top, LT, LH);
+    highlight(drag.target);
   }
-
-  function onUp(ev){
-    if(!drag){ return; }
+  function finish(commit, ev){
     var d=drag; drag=null;
-    d.bar.style.transform="";
+    try{ d.bar.releasePointerCapture(ev.pointerId); }catch(e){}
     d.bar.classList.remove("dragging");
     clearHighlight();
-    if(d.moved && d.target && d.target!==d.from){
-      nonce+=1;
-      setValue({row_id:d.item.row_id,from:d.from,to:d.target,nonce:nonce});
+    var to=(LANES[d.target]?LANES[d.target].key:d.fromKey);
+    if(commit && d.moved && to!==d.fromKey){
+      d.bar.classList.add("pending");          // the rerun redraws it in its new lane
+      pendingArgs=null;
+      setValue({key:d.item.key, from:d.fromKey, to:to, nonce:uid()});
+      return;
     }
+    d.bar.style.transform="";
+    if(pendingArgs){ ARGS=pendingArgs; pendingArgs=null; adjustPass=0; render(); }
   }
+  function onUp(ev){ if(drag){ finish(true, ev); } }
+  function onCancel(ev){ if(drag){ finish(false, ev); } }
 
-  function indexFromY(clientY){
-    var plot=document.querySelector(".plot");
-    if(!plot){ return 0; }
-    var rect=plot.getBoundingClientRect();
-    var idx=Math.floor((clientY-rect.top)/ROWH);
-    if(idx<0){ idx=0; }
-    if(idx>EXPERTS.length-1){ idx=EXPERTS.length-1; }
-    return idx;
-  }
-
-  function highlight(idx){
-    clearHighlight();
-    var all=document.querySelectorAll(".lane");
-    if(all[idx]){ all[idx].classList.add("target"); }
-  }
-  function clearHighlight(){
-    var t=document.querySelectorAll(".lane.target");
-    for(var i=0;i<t.length;i++){ t[i].classList.remove("target"); }
-  }
+  function highlight(i){ clearHighlight(); if(LANE_ELS[i]){ LANE_ELS[i].classList.add("target"); } }
+  function clearHighlight(){ for(var i=0;i<LANE_ELS.length;i++){ LANE_ELS[i].classList.remove("target"); } }
 </script>
 </body>
 </html>
