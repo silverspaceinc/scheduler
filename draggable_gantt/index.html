@@ -52,10 +52,14 @@
   .bar.pending { opacity:.55; }
   .bar span { pointer-events:none; }
   .xaxis { display:flex; }
-  .xspacer { width:172px; flex:none; }
-  .xticks { position:relative; flex:1; height:18px; min-width:0; }
-  .xt { position:absolute; top:2px; font-size:10px; opacity:.7; white-space:nowrap;
-    transform:translateX(-50%); }
+  .xspacer { flex:none; }
+  .xticks { position:relative; flex:1; min-width:0; overflow:visible; }
+  /* Tick labels are rotated 90deg (reading bottom-to-top) so they never
+     collide on a narrow phone screen. transform-origin 0 0 + the translate
+     makes the label hang BELOW the axis, centred on its tick. */
+  .xt { position:absolute; top:3px; font-size:10px; line-height:1;
+    opacity:.75; white-space:nowrap; transform-origin:0 0;
+    transform:rotate(-90deg) translate(-100%, -6px); }
   .xtitle { text-align:center; font-size:12px; opacity:.85; margin-top:2px; }
   .hint { font-size:11px; opacity:.6; margin:6px 2px 0 2px; }
   .empty { padding:14px; opacity:.6; font-size:12px; }
@@ -95,6 +99,16 @@
     }
     return Math.max(1, ends.length);
   }
+  function pickStep(span, widthPx){
+    /* Choose a tick interval (minutes) so rotated labels never crowd.
+       Each rotated label is ~13px thick; allow 20px per tick. */
+    var maxTicks = Math.max(2, Math.floor(widthPx / 20));
+    var options = [30, 60, 90, 120, 180, 240, 360];
+    for(var i=0;i<options.length;i++){
+      if(Math.ceil(span / options[i]) <= maxTicks){ return options[i]; }
+    }
+    return 360;
+  }
   function laneAt(y, tops, heights){
     /* Lane index under a y offset; outside any lane -> nearest lane. */
     var best=0, bestD=Infinity;
@@ -119,10 +133,14 @@
     adjustPass=0;
     if(!drag){ render(); }
   });
-  var _rt=null;
+  var _rt=null, _lastW=0;
   window.addEventListener("resize", function(){
     if(_rt){ clearTimeout(_rt); }
-    _rt=setTimeout(function(){ if(!drag){ adjustPass=0; render(); } }, 100);
+    _rt=setTimeout(function(){
+      var w=document.getElementById("wrap");
+      var cw=w?w.clientWidth:0;
+      if(!drag && (Math.abs(cw-_lastW)>8 || expanded)){ _lastW=cw; adjustPass=0; render(); }
+    }, 120);
   });
 
   function el(cls, txt){
@@ -213,8 +231,9 @@
     var yl=el("ylabel"); var ys=document.createElement("span"); ys.textContent="Expert"; yl.appendChild(ys);
     chart.appendChild(yl);
 
+    var GUT = (wrap.clientWidth && wrap.clientWidth < 620) ? 104 : 150;
     var grid=el("grid");
-    var gutter=el("gutter"); gutter.style.height=plotH+"px";
+    var gutter=el("gutter"); gutter.style.height=plotH+"px"; gutter.style.width=GUT+"px";
     for(i=0;i<n;i++){
       var kc=KIND_CLASS[LANES[i].key]||"";
       var gn=el("gname"+(LANES[i].kind==="status"?" status "+kc:""), LANES[i].label);
@@ -260,13 +279,9 @@
     chart.appendChild(grid);
     W.appendChild(chart);
 
-    var xa=el("xaxis"); xa.appendChild(el("xspacer"));
+    var xa=el("xaxis");
+    var xsp=el("xspacer"); xsp.style.width=(22+GUT)+"px"; xa.appendChild(xsp);
     var xt=el("xticks");
-    for(i=0;i<ticks.length;i++){
-      var tp=(ticks[i].min-tmin)/span*100;
-      if(!(tp>=0 && tp<=100)){ continue; }
-      var td=el("xt", ticks[i].label); td.style.left=tp+"%"; xt.appendChild(td);
-    }
     xa.appendChild(xt);
     W.appendChild(xa);
     var xtitle=el("xtitle","Time (EDT)");
@@ -275,6 +290,28 @@
       W.appendChild(el("hint","Drag a bar up or down to another lane. Time is locked — only the lane changes. Overlapping bars stack instead of hiding; a red ring marks an overlap."));
     }
     wrap.appendChild(W);
+
+    /* ── x-axis ticks (drawn after layout, with adaptive density) ──
+       Rotated 90deg, so the band is as tall as the longest label. */
+    (function(){
+      var px = plot.offsetWidth || wrap.clientWidth || 600;
+      var step = pickStep(span, px);
+      var maxLen = 0;
+      for(var q=0;q<ticks.length;q++){
+        maxLen = Math.max(maxLen, String(ticks[q].label).length);
+      }
+      var labelH = Math.ceil(maxLen * 6.2) + 12;     // 10px font, rotated
+      xt.style.height = labelH + "px";
+      for(var q=0;q<ticks.length;q++){
+        var tm = ticks[q].min;
+        if((tm - tmin) % step !== 0){ continue; }     // thin the ticks on narrow screens
+        var tp = (tm - tmin) / span * 100;
+        if(!(tp>=0 && tp<=99.5)){ continue; }
+        var td = el("xt", ticks[q].label);
+        td.style.left = tp + "%";
+        xt.appendChild(td);
+      }
+    })();
 
     /* exact full-screen fit: chrome = above chart + below chart (never the leftover) */
     if(expanded){
