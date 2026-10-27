@@ -22,6 +22,7 @@ import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -40,9 +41,9 @@ try:
 except Exception:
     HAS_AUTOREFRESH = False
 
-APP_VERSION = "SCHED v3.0 — status lanes · stacked bars · live refresh · 6h login"
+APP_VERSION = "SCHED v3.1 — status lanes · stacked bars · live refresh · 6h login"
 
-st.set_page_config(page_title="Vizva Scheduler [v3.0]", page_icon="🗓️", layout="wide")
+st.set_page_config(page_title="Vizva Scheduler [v3.1]", page_icon="🗓️", layout="wide")
 
 API_KEY = st.secrets.get("API_KEY", "")
 BASE_URL = st.secrets.get("BASE_URL", "")
@@ -539,6 +540,240 @@ def handle_drag(event, df, selected_date):
     return True
 
 
+_WEEKEND_LUT = None
+
+
+def _weekend_lut():
+    """LUT[w][n] = weekend days inside n consecutive days starting on weekday w."""
+    global _WEEKEND_LUT
+    if _WEEKEND_LUT is None:
+        _WEEKEND_LUT = [[sum(1 for k in range(n) if ((w + k) % 7) >= 5) for n in range(7)]
+                        for w in range(7)]
+    return _WEEKEND_LUT
+
+
+def weekday_hours_between(start, end):
+    """Elapsed hours EXCLUDING Saturday and Sunday (entire days).
+
+    Every weekday contributes its full 24 hours, every weekend day 0, so a task
+    dated Friday 10:00 is 24 weekday-hours old on Monday 10:00 (not 72).
+    Returns a float Series aligned to `start`; NaN where the date is missing.
+    """
+    s = start if isinstance(start, pd.Series) else pd.Series(start)
+    s = pd.to_datetime(s, errors="coerce")
+    if isinstance(end, pd.Series):
+        e = pd.to_datetime(end.reindex(s.index), errors="coerce")
+    else:
+        e = pd.Series([pd.to_datetime(end, errors="coerce")] * len(s), index=s.index)
+
+    out = pd.Series(float("nan"), index=s.index, dtype=float)
+    m = s.notna() & e.notna()
+    if not m.any():
+        return out
+
+    sv, ev = s[m], e[m]
+    total = ((ev - sv).dt.total_seconds() / 3600.0).values
+    s_day, e_day = sv.dt.normalize(), ev.dt.normalize()
+    s_wd = s_day.dt.dayofweek.values
+    e_wd = e_day.dt.dayofweek.values
+    gap = (e_day - s_day).dt.days.values
+    s_frac = ((sv - s_day).dt.total_seconds() / 3600.0).values
+    e_frac = ((ev - e_day).dt.total_seconds() / 3600.0).values
+
+    w_s, w_e = s_wd >= 5, e_wd >= 5
+    same = gap == 0
+
+    weekend = np.zeros(len(sv))
+    weekend[same & w_s] = total[same & w_s]              # whole span on a weekend
+    diff = ~same
+    weekend[diff & w_s] = 24.0 - s_frac[diff & w_s]      # tail of the start day
+    weekend[diff & w_e] += e_frac[diff & w_e]            # head of the end day
+
+    n_int = np.clip(gap - 1, 0, None).astype(int)        # whole days strictly between
+    full, rem = n_int // 7, n_int % 7
+    lut = _weekend_lut()
+    first_wd = (s_wd + 1) % 7
+    weekend += (full * 2 + np.array([[lut[w][r] for r in range(7)]
+                                     for w in range(7)])[first_wd, rem]) * 24.0
+
+    out[m] = np.clip(total - weekend, 0.0, None)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PENDING TASKS — stale / unactioned work, by support type
+#
+#  RULE
+#    Interview Support and Mock Interview:
+#        status is Pending or NULL  AND  the task date is >48h in the past
+#    Assessment Support and Resume Understanding:
+#        status is Pending or NULL  (any age)
+#    The expert is never "Self".
+# ═══════════════════════════════════════════════════════════════════
+PENDING_STALE_HOURS = 48
+PENDING_COUNT_WEEKDAYS_ONLY = True   # Sat/Sun do not age a task
+PENDING_NULLISH = {"", "nan", "none", "null", "na", "n/a", "-", "--", "nat", "not done"}
+
+PENDING_COLS = ["Support", "Candidate", "Company", "Round", "Expert", "Expert Active",
+                "Status", "Task Date", "Age (weekday h)", "Age (calendar h)", "Age (days)"]
+
+
+def _is_pending_or_null(value):
+    """True when a status is 'pending', empty, or a null placeholder."""
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+    return str(value).strip().lower() in PENDING_NULLISH or \
+        str(value).strip().lower() == "pending"
+
+
+def _pending_support_group(name):
+    """'interview' (needs the 48h rule) | 'any_age' | None (not listed)."""
+    s = str(name or "").strip().lower()
+    if not s:
+        return None
+    if "interview" in s:                       # Interview Support, Mock Interview
+        return "interview"
+    if "assessment" in s or "resume" in s:     # Assessment Support, Resume Understanding
+        return "any_age"
+    return None
+
+
+def _active_label(value):
+    """'Yes' / 'No' / '' from the expert status flag (bool or string)."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return "Yes" if str(value).strip().lower() in ("true", "1", "yes", "y") else "No"
+
+
+def build_pending_tasks(df, now_edt=None):
+    """Pending / NULL tasks that qualify for the follow-up list."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=PENDING_COLS)
+
+    d = df.copy()
+    now_naive = (now_edt or datetime.now(EDT)).replace(tzinfo=None)
+
+    # ── 1. status must be Pending or NULL ────────────────────────
+    if "task_status" in d.columns:
+        d = d[d["task_status"].apply(_is_pending_or_null)]
+    if d.empty:
+        return pd.DataFrame(columns=PENDING_COLS)
+
+    # ── 2. the expert must never be Self ─────────────────────────
+    if "expert_name" in d.columns:
+        expert = d["expert_name"].astype(str).str.strip()
+    else:
+        expert = pd.Series("", index=d.index)
+        d["expert_name"] = expert
+    d = d[expert.str.lower() != "self"]
+    if d.empty:
+        return pd.DataFrame(columns=PENDING_COLS)
+    d = d.copy()
+    d["_expert"] = d["expert_name"].astype(str).str.strip()
+
+    # ── 3. age in hours ──────────────────────────────────────────
+    if "date" in d.columns:
+        when = pd.to_datetime(d["date"], errors="coerce").dt.tz_localize(None)
+    else:
+        when = pd.Series(pd.NaT, index=d.index)
+    age_h = (now_naive - when).dt.total_seconds() / 3600.0
+    # the 48-hour clock counts weekdays only, so weekends never age a task
+    age_used = (weekday_hours_between(when, now_naive)
+                if PENDING_COUNT_WEEKDAYS_ONLY else age_h)
+
+    # ── 4. per-support rule ──────────────────────────────────────
+    if "support_name" in d.columns:
+        group = d["support_name"].apply(_pending_support_group)
+    else:
+        group = pd.Series(None, index=d.index)
+    interview_stale = (group == "interview") & age_used.notna() & (age_used >= PENDING_STALE_HOURS)
+    any_age = (group == "any_age")
+    d = d[interview_stale | any_age]
+    if d.empty:
+        return pd.DataFrame(columns=PENDING_COLS)
+
+    keep = d.index
+    out = pd.DataFrame({
+        "Support": d["support_name"].astype(str).str.strip() if "support_name" in d.columns else "",
+        "Candidate": d["candidate_name"].astype(str).str.strip() if "candidate_name" in d.columns else "",
+        "Company": d["company_name"].astype(str).str.strip() if "company_name" in d.columns else "",
+        "Round": d["round_name"].astype(str).str.strip() if "round_name" in d.columns else "",
+        "Expert": d["_expert"],
+        "Expert Active": (d["expert_status_flag"].apply(_active_label)
+                          if "expert_status_flag" in d.columns else ""),
+        "Status": (d["task_status"].astype(str).str.strip().str.lower()
+                   if "task_status" in d.columns else "pending"),
+        "Task Date": when.loc[keep].dt.strftime("%Y-%m-%d"),
+        "Age (weekday h)": age_used.loc[keep].round(1),
+        "Age (calendar h)": age_h.loc[keep].round(1),
+        "Age (days)": (age_h.loc[keep] / 24.0).round(1),
+    }, index=keep)
+    out["Support"] = out["Support"].replace({"nan": ""})
+    out = out.sort_values(["Support", "Age (weekday h)"], ascending=[True, False])
+    return out.reset_index(drop=True)[PENDING_COLS]
+
+
+def render_pending_tasks(all_case_df):
+    """Bottom-of-page follow-up list, split by support type."""
+    st.markdown("---")
+    st.header("⏳ Pending Tasks — follow-up required")
+    st.caption(
+        "**Interview Support / Mock Interview:** still Pending (or no status) and more than "
+        + str(PENDING_STALE_HOURS) + " working hours past the task date — "
+        + ("**Saturday and Sunday are not counted**, so a Friday task only ages from Monday. "
+           if PENDING_COUNT_WEEKDAYS_ONLY else "") + 
+        "**Assessment Support / Resume Understanding:** still Pending (or no status), at any "
+        "age. The expert is never *Self*."
+    )
+
+    tbl = build_pending_tasks(all_case_df)
+    if tbl.empty:
+        st.success("Nothing pending matches these rules right now.")
+        return
+
+    by_support = (tbl.groupby("Support").size()
+                  .sort_values(ascending=False).rename("Pending Tasks").reset_index())
+    by_support["Oldest (days)"] = [
+        float(tbl.loc[tbl["Support"] == s, "Age (days)"].max()) for s in by_support["Support"]
+    ]
+
+    cols = st.columns(min(4, len(by_support) + 1))
+    cols[0].metric("Total pending", len(tbl))
+    for i, row in enumerate(by_support.head(3).itertuples(index=False)):
+        cols[i + 1].metric(str(row.Support) or "Unknown", int(getattr(row, "_2")))
+
+    st.markdown("**By support type**")
+    st.dataframe(by_support, use_container_width=True, hide_index=True)
+
+    order = [s for s in ["Interview Support", "Mock Interview",
+                         "Assessment Support", "Resume Understanding"]
+             if s in set(tbl["Support"].tolist())]
+    order += [s for s in tbl["Support"].unique().tolist() if s not in order]
+    order = [s for s in order if str(s).strip()]
+
+    tabs = st.tabs([(s if str(s).strip() else "Unknown") for s in order])
+    for tab, name in zip(tabs, order):
+        with tab:
+            sub = tbl[tbl["Support"] == name]
+            st.caption(str(len(sub)) + " task(s) · oldest "
+                       + str(round(float(sub["Age (days)"].max()), 1)) + " day(s)")
+            st.dataframe(sub, use_container_width=True, hide_index=True)
+
+    st.download_button("⬇️ Download pending tasks (CSV)",
+                       data=tbl.to_csv(index=False).encode("utf-8"),
+                       file_name="pending_tasks.csv", mime="text/csv")
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════
@@ -583,6 +818,7 @@ def main():
     if selected_date != today:
         st.info("The manual planner is available **today only** (%s EDT). You are viewing %s "
                 "— pick today's date above to plan lanes." % (today, selected_date))
+        render_pending_tasks(all_case_df)
         return
 
     st.caption("Drag a bar up or down into another lane — the time never changes. Below the "
@@ -659,6 +895,9 @@ def main():
              "Moved to": lane_label(mv.get("to", "")), "Saved at (UTC)": mv.get("at")}
             for key, mv in block.items()
         ]), use_container_width=True, hide_index=True)
+
+    # ── bottom of page: stale / unactioned pending work ─────────────
+    render_pending_tasks(all_case_df)
 
 
 if __name__ == "__main__":
