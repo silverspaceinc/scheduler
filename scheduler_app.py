@@ -48,7 +48,18 @@ st.set_page_config(page_title="Vizva Scheduler [v3.1]", page_icon="🗓️", lay
 API_KEY = st.secrets.get("API_KEY", "")
 BASE_URL = st.secrets.get("BASE_URL", "")
 
-EDT = timezone(timedelta(hours=-4))
+# ── Timezone: real New York rules, so EDT/EST switch automatically ──
+try:
+    from zoneinfo import ZoneInfo
+    EDT = ZoneInfo("America/New_York")
+except Exception:                       # missing tzdata -> fixed EST fallback
+    EDT = timezone(timedelta(hours=-5), "EST")
+
+
+def tz_abbr(moment=None):
+    """'EDT' in summer, 'EST' in winter."""
+    name = (moment or datetime.now(EDT)).tzname() or ""
+    return name if name in ("EDT", "EST") else "ET"
 REFRESH_SECONDS = 120          # live data refresh
 SESSION_HOURS = 6              # login lifetime
 MOVES_TTL_HOURS = 24           # saved-move lifetime
@@ -516,7 +527,7 @@ def render_planner(df, all_expert_names, selected_date):
 
     return _draggable_gantt(
         rows=rows, lanes=lanes, legend=LEGEND,
-        title="✋ Manual Planner — " + str(selected_date) + " (EDT)",
+        title="✋ Manual Planner — " + str(selected_date) + " (" + tz_abbr() + ")",
         tmin=tmin, tmax=tmax, ticks=ticks, now_min=now_min,
         shift_start=SHIFT_START_MIN, shift_end=SHIFT_END_MIN,
         key="drag_gantt", default=None)
@@ -804,7 +815,7 @@ def main():
     if all_case_df is None or all_case_df.empty:
         st.warning("No data returned by the API.")
         st.stop()
-    st.caption("Data loaded at " + datetime.now(EDT).strftime("%I:%M:%S %p") + " EDT")
+    st.caption("Data loaded at " + datetime.now(EDT).strftime("%I:%M:%S %p") + " " + tz_abbr())
 
     render_schedule_view(all_case_df, active_expert_df)
 
@@ -816,7 +827,7 @@ def main():
     selected_date = st.session_state.get("schedule_date", date.today())
     today = datetime.now(EDT).date()
     if selected_date != today:
-        st.info("The manual planner is available **today only** (%s EDT). You are viewing %s "
+        st.info("The manual planner is available **today only** (%s " + tz_abbr() + "). You are viewing %s "
                 "— pick today's date above to plan lanes." % (today, selected_date))
         render_pending_tasks(all_case_df)
         return
