@@ -1465,8 +1465,8 @@ def render_schedule_gantt(sched, selected_date, all_expert_names=None):
     if selected_date == now_et.date():
         # Build marker using the SAME reference date (2000-01-01) as the chart
         now_marker = ref.replace(
-            hour=now_edt.hour,
-            minute=now_edt.minute,
+            hour=now_et.hour,
+            minute=now_et.minute,
             second=0,
             microsecond=0,
         )
