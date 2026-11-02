@@ -666,13 +666,13 @@ def _active_label(value):
     return "Yes" if str(value).strip().lower() in ("true", "1", "yes", "y") else "No"
 
 
-def build_pending_tasks(df, now_edt=None):
+def build_pending_tasks(df, now_et=None):
     """Pending / NULL tasks that qualify for the follow-up list."""
     if df is None or df.empty:
         return pd.DataFrame(columns=PENDING_COLS)
 
     d = df.copy()
-    now_naive = (now_edt or datetime.now(EDT)).replace(tzinfo=None)
+    now_naive = (now_et or datetime.now(EDT)).replace(tzinfo=None)
 
     # ── 1. status must be Pending or NULL ────────────────────────
     if "task_status" in d.columns:
