@@ -34,6 +34,20 @@ CLR = {"completed": "#2ecc71", "rescheduled": "#f39c12",
 SHIFT_START_MIN = 210
 SHIFT_END_MIN   = 750
 GAP_MINUTES     = 10
+
+# ── Timezone: real New York rules, so EDT/EST switch automatically ──
+try:
+    from zoneinfo import ZoneInfo
+    ET = ZoneInfo("America/New_York")
+except Exception:                       # missing tzdata -> fixed EST fallback
+    ET = timezone(timedelta(hours=-5), "EST")
+
+
+def tz_abbr(moment=None):
+    """'EDT' in summer, 'EST' in winter — for chart titles."""
+    name = (moment or datetime.now(ET)).tzname() or ""
+    return name if name in ("EDT", "EST") else "ET"
+
 EXPERT_CONFIG_FILENAME = "vizva_expert_config.json"
 _EXCEL_MAX_CELL_LEN = 32767
 
@@ -732,8 +746,8 @@ def render_oos_section(df, title_suffix=""):
 
     st.subheader("Out-of-Shift Interview Analysis" + title_suffix)
     st.caption(
-        "Shift: 3:30 AM - 12:30 PM EDT. Interviews before 3:30 AM or on/after "
-        "12:30 PM EDT are classified as **Out of Shift**. Only **completed** "
+        "Shift: 3:30 AM - 12:30 PM ET. Interviews before 3:30 AM or on/after "
+        "12:30 PM ET are classified as **Out of Shift**. Only **completed** "
         "interviews by **non-Self** experts are analyzed."
     )
 
@@ -770,7 +784,7 @@ def render_oos_section(df, title_suffix=""):
                 text=counts, textposition="outside",
             ))
             fig_hour.update_layout(title="OOS Interviews by Hour" + title_suffix,
-                                   height=400, xaxis_title="Hour of Day (EDT)",
+                                   height=400, xaxis_title="Hour of Day (ET)",
                                    yaxis_title="OOS Interviews",
                                    xaxis=dict(tickangle=-45))
             st.plotly_chart(fig_hour, use_container_width=True)
@@ -1434,10 +1448,10 @@ def render_schedule_gantt(sched, selected_date, all_expert_names=None):
                   annotation_position="top")
 
     fig.update_layout(
-        title="Expert Schedule - " + str(selected_date) + " (EDT)",
+        title="Expert Schedule - " + str(selected_date) + " (ET)",
         height=max(500, len(expert_order) * 45),
         xaxis=dict(type="date", tickformat="%I:%M %p",
-                   range=[range_start, range_end], title="Time (EDT)",
+                   range=[range_start, range_end], title="Time (ET)",
                    dtick=30 * 60 * 1000),
         yaxis=dict(categoryorder="array", categoryarray=expert_order[::-1], title="Expert"),
         barmode="overlay",
@@ -1446,10 +1460,9 @@ def render_schedule_gantt(sched, selected_date, all_expert_names=None):
     )
 
     # -- Current-time marker line (only on today) -------------
-    EDT = timezone(timedelta(hours=-4))
-    now_edt = datetime.now(EDT)
+    now_et = datetime.now(ET)
     
-    if selected_date == now_edt.date():
+    if selected_date == now_et.date():
         # Build marker using the SAME reference date (2000-01-01) as the chart
         now_marker = ref.replace(
             hour=now_edt.hour,
@@ -1479,8 +1492,8 @@ def render_schedule_gantt(sched, selected_date, all_expert_names=None):
 
 def render_availability_summary(sched, selected_date, all_expert_names=None):
     """Show expert availability — free slots between interviews."""
-    st.subheader("Expert Availability — " + str(selected_date) + " (EDT)")
-    st.caption("Free gaps between scheduled interviews (working hours: 8 AM – 10 PM EDT)")
+    st.subheader("Expert Availability — " + str(selected_date) + " (ET)")
+    st.caption("Free gaps between scheduled interviews (working hours: 8 AM – 10 PM ET)")
 
     work_start = 8 * 60
     work_end = 22 * 60
@@ -1532,7 +1545,7 @@ def render_availability_summary(sched, selected_date, all_expert_names=None):
                     "Interviews": 0,
                     "Busy Time": "0 min",
                     "Clashes": "No",
-                    "Free Slots": "Fully available (8:00 AM – 10:00 PM EDT)",
+                    "Free Slots": "Fully available (8:00 AM – 10:00 PM ET)",
                 })
 
     if not avail_rows:
@@ -2151,10 +2164,10 @@ def render_resolved_gantt(resolved, selected_date, all_expert_names=None):
                   annotation_text="Shift End 12:30 PM", annotation_position="top")
 
     fig.update_layout(
-        title="🧠 Resolved Expert Schedule — " + str(selected_date) + " (EDT)",
+        title="🧠 Resolved Expert Schedule — " + str(selected_date) + " (ET)",
         height=max(500, len(expert_order) * 45),
         xaxis=dict(type="date", tickformat="%I:%M %p",
-                   range=[range_start, range_end], title="Time (EDT)",
+                   range=[range_start, range_end], title="Time (ET)",
                    dtick=30 * 60 * 1000),
         yaxis=dict(categoryorder="array", categoryarray=expert_order[::-1],
                    title="Expert"),
@@ -2164,10 +2177,9 @@ def render_resolved_gantt(resolved, selected_date, all_expert_names=None):
     )
 
     # Current time marker
-    EDT = timezone(timedelta(hours=-4))
-    now_edt = datetime.now(EDT)
-    if selected_date == now_edt.date():
-        now_marker = ref.replace(hour=now_edt.hour, minute=now_edt.minute,
+    now_et = datetime.now(ET)
+    if selected_date == now_et.date():
+        now_marker = ref.replace(hour=now_et.hour, minute=now_et.minute,
                                   second=0, microsecond=0)
         fig.add_vline(x=now_marker, line_width=2, line_dash="dash",
                       line_color="#FF00FF", annotation_text="Now",
@@ -2806,7 +2818,7 @@ def render_expert_config_panel(all_expert_names, all_rounds):
 def render_schedule_view(all_data, active_expert_df):
     """Main renderer for the Schedule View page."""
     st.header("Schedule View")
-    st.caption("Select any date to see Interview Support interviews organized by expert timeline (EDT)")
+    st.caption("Select any date to see Interview Support interviews organized by expert timeline (ET)")
 
     if "date" not in all_data.columns:
         st.warning("No date column available in data.")
@@ -3004,7 +3016,7 @@ def render_schedule_view(all_data, active_expert_df):
             st.subheader("Out-of-Shift Interviews - " + str(selected_date))
             st.caption(
                 "All interviews (any status, including Self) scheduled "
-                "outside the shift window (3:30 AM - 12:30 PM EDT). "
+                "outside the shift window (3:30 AM - 12:30 PM ET). "
                 "Purple/orange bars in the Gantt above flag OOS."
             )
             oos_k = st.columns(5)
